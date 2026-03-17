@@ -146,7 +146,7 @@ server.initialize()
 
 ## Using with Vyper Contracts
 
-circle-titanoboa-sdk uses titanoboa internally, so you can combine x402 payments with Vyper contract interactions seamlessly.
+circle-titanoboa-sdk uses titanoboa internally, so you can combine x402 payments with Vyper contract interactions.
 
 ```vyper
 # storage.vy
@@ -451,6 +451,149 @@ setup_boa_with_account("arcTestnet", "0xPrivateKey...")
 USDC contract addresses sourced from https://developers.circle.com/stablecoins/usdc-contract-addresses
 
 **Note:** Arc Testnet uses USDC as the native gas token. Gateway Domain IDs are Circle's internal domain identifiers, not chain IDs.
+
+## Using x402 SDK Hooks with circlekit
+
+The [`x402` Python package](https://github.com/coinbase/x402) provides lifecycle hooks on `x402ResourceServer` for injecting custom logic before/after payment verification and settlement. Combined with circlekit's Gateway operations, you can trigger wallet actions (deposits, withdrawals) in response to payment events.
+
+**Division of labor:** circlekit handles Gateway wallet operations (deposit, withdraw, balances). x402 handles payment protocol hooks (verify, settle, lifecycle events).
+
+### Server-Side Settlement Hooks
+
+`x402ResourceServer` exposes hook decorators for each stage of the payment lifecycle:
+
+```python
+from x402.server import x402ResourceServer
+from circlekit import BatchFacilitatorClient, GatewayClient
+
+# Set up x402 with circlekit's facilitator
+server = x402ResourceServer(BatchFacilitatorClient())
+
+# circlekit client for Gateway operations
+gateway = GatewayClient(chain="arcTestnet", private_key="0x...")
+
+async def on_payment_settled(context):
+    """Runs after a payment is successfully settled."""
+    print(f"Payment settled: {context}")
+    # Trigger a Gateway deposit after receiving payment
+    await gateway.deposit("1.0")
+
+async def on_settle_failed(context):
+    """Runs when settlement fails."""
+    print(f"Settlement failed: {context}")
+
+async def on_before_verify(context):
+    """Runs before payment verification — use for logging or gating."""
+    balances = await gateway.get_balances()
+    print(f"Current Gateway balance: {balances}")
+
+server.on_after_settle(on_payment_settled)
+server.on_settle_failure(on_settle_failed)
+server.on_before_verify(on_before_verify)
+```
+
+Available hooks: `on_before_verify`, `on_after_verify`, `on_verify_failure`, `on_before_settle`, `on_after_settle`, `on_settle_failure`. Each takes a callable and returns `Self` (builder pattern).
+
+### Client-Side: httpx with Automatic Payments
+
+The x402 Python SDK provides `x402HttpxClient` (transport-based, not event hooks) for automatic 402 handling on the client side:
+
+```python
+import asyncio
+from x402 import x402Client
+from x402.http.clients import x402HttpxClient
+from x402.mechanisms.evm import EthAccountSigner
+from x402.mechanisms.evm.exact.register import register_exact_evm_client
+from eth_account import Account
+
+async def main():
+    account = Account.from_key("0x...")
+    client = x402Client()
+    register_exact_evm_client(client, EthAccountSigner(account))
+
+    async with x402HttpxClient(client) as http:
+        response = await http.get("https://api.example.com/premium")
+        print(response.text)  # 402 handled automatically
+
+asyncio.run(main())
+```
+
+> **Note:** `x402_httpx_hooks()` is deprecated — httpx event hooks cannot modify responses. Use `x402HttpxClient` or `x402AsyncTransport` instead.
+
+### Post-Settlement Gateway Actions
+
+A full example combining x402 server hooks with circlekit Gateway operations — auto-withdraw revenue after each settled payment:
+
+```python
+import asyncio
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from x402.server import x402ResourceServer
+from circlekit import BatchFacilitatorClient, GatewayClient, create_gateway_middleware
+
+app = FastAPI()
+
+# x402 server with lifecycle hooks
+server = x402ResourceServer(BatchFacilitatorClient())
+
+# circlekit Gateway client for wallet operations
+gateway_client = GatewayClient(chain="arcTestnet", private_key="0x...")
+
+# circlekit middleware for 402 handling
+gateway = create_gateway_middleware(
+    seller_address=gateway_client.address,
+    chain="arcTestnet",
+)
+
+REVENUE_THRESHOLD = 10.0  # USDC
+
+async def auto_withdraw_revenue(context):
+    """Withdraw to L1 when revenue exceeds threshold."""
+    balances = await gateway_client.get_balances()
+    gateway_balance = float(balances.get("gateway", "0"))
+    if gateway_balance >= REVENUE_THRESHOLD:
+        await gateway_client.withdraw("5.0", chain="baseSepolia")
+        print(f"Auto-withdrew 5.0 USDC (balance was {gateway_balance})")
+
+server.on_after_settle(auto_withdraw_revenue)
+
+@app.get("/api/data")
+async def paid_endpoint(request: Request):
+    result = await gateway.process_request(
+        payment_header=request.headers.get("PAYMENT-SIGNATURE"),
+        path=request.url.path,
+        price="$0.05",
+    )
+
+    if isinstance(result, dict):
+        resp = JSONResponse(result["body"], status_code=result["status"])
+        for k, v in result.get("headers", {}).items():
+            resp.headers[k] = v
+        return resp
+
+    resp = JSONResponse({"data": "premium content", "paid_by": result.payer})
+    for k, v in result.response_headers.items():
+        resp.headers[k] = v
+    return resp
+```
+
+### Trustless Withdrawal in Hooks
+
+For post-settlement actions that avoid trusting the Gateway API, use trustless withdrawal:
+
+```python
+async def trustless_auto_withdraw(context):
+    """Use on-chain delay-based withdrawal instead of the Gateway API."""
+    await gateway_client.initiate_trustless_withdrawal("1.0")
+    # Later (after delay blocks), complete it:
+    # await gateway_client.complete_trustless_withdrawal()
+
+server.on_after_settle(trustless_auto_withdraw)
+```
+
+### Atomic On-Chain Post-Settlement
+
+For fully atomic post-settlement logic executed on-chain (not in application code), see the [x402-exec RFC](https://github.com/coinbase/x402/issues/584). This enables settlement + action in a single transaction, removing the need for off-chain hooks entirely.
 
 ## Known Limitations
 
